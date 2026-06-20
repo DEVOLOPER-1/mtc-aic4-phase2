@@ -1,0 +1,30 @@
+[project]
+name = "mtc-aic4-phase2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "gdown>=6.1.0",
+    "opencv-python>=4.13.0.92",
+    "ruff>=0.15.18", #please always format and lint your code with ruff
+    "torch>=2.12.1",
+]
+
+# Quick Start
+#
+# 1. Create a virtual environment using uv:
+#    uv venv
+#
+# 2. Activate the virtual environment:
+#    source .venv/bin/activate   # on Unix or macOS
+#    .venv\\Scripts\\activate    # on Windows
+#
+# 3. Install dependencies:
+#    uv pip install -e .
+#
+# 4. (Optional) Install development dependencies if any are defined.
+#    uv pip install -e .[dev]
+#
+# 5. Run the project or tests as appropriate.
