@@ -62,4 +62,4 @@ def download_checkpoint(file_id, checkpoint_dir="./checkpoints"):
     return checkpoint_path
 
 if __name__ == "__main__":
-    download_checkpoint("YOUR_FILE_ID")
+    download_checkpoint("1qLZT-t4KaD0L13T2DCN8XyB74PN4c-GM")
