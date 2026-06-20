@@ -8,6 +8,9 @@ requires-python = ">=3.12"
 dependencies = [
     "gdown>=6.1.0",
     "opencv-python>=4.13.0.92",
+    "pandas>=2.2.0",
+    "scipy>=1.14.0",
+    "timm>=1.0.0",
     "ruff>=0.15.18", #please always format and lint your code with ruff
     "torch>=2.12.1",
 ]
