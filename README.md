@@ -96,13 +96,11 @@ python download.py
 
 This downloads the full-precision checkpoint into `checkpoints/model.pth`.
 
-> Replace `"YOUR_FILE_ID"` in `download.py` with the actual Google Drive file ID, or place the checkpoint file manually at `checkpoints/model.pth`.
 
 For the quantized checkpoint, place it at:
 ```
 checkpoints/model_quantized.pth
 ```
-[PLACEHOLDER — add download command or link for quantized checkpoint]
 
 ---
 
