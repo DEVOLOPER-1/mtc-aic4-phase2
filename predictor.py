@@ -5,8 +5,14 @@ The evaluation script only expects two public entry points from this module:
 - :func:`load_model`
 - :func:`run_tracker`
 
-This file keeps the pipeline structure intact while adding:
+This file keeps the pipeline structure intact while merging all model logic
+from abavitrack.py, including:
 
+- Adaptive Synergy (dynamic confidence/similarity thresholds)
+- Hanning window response map
+- Cosine similarity feature memory
+- Dynamic search factor expansion (OOV panic state)
+- AbaViT Preprocessor-style image handling
 - compatibility shims for the copied model package under the legacy ``lib.*``
   namespace used inside the checkpoint/model code
 - resilient checkpoint loading with ``torch.load``
@@ -26,6 +32,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import cv2
 import torch
+import torch.nn.functional as F
 
 from download import download_checkpoint
 
@@ -36,9 +43,14 @@ TEMPLATE_SIZE = 128
 SEARCH_SIZE = 256
 TEMPLATE_FACTOR = 2.0
 SEARCH_FACTOR = 4.5
+BACKBONE_STRIDE = 16
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+
+# ---------------------------------------------------------------------------
+# Legacy namespace / module-loader helpers
+# ---------------------------------------------------------------------------
 
 def _package(name: str, path: Path) -> types.ModuleType:
     module = sys.modules.get(name)
@@ -205,9 +217,10 @@ def _default_cfg() -> SimpleNamespace:
             PRETRAIN_FILE="",
             BACKBONE=SimpleNamespace(
                 TYPE="abavit_patch16_224",
-                STRIDE=16,
+                STRIDE=BACKBONE_STRIDE,
                 CAT_MODE="direct",
                 SEP_SEG=False,
+                CE_LOC=[3, 6, 9],  # required by CE mask logic in abavitrack.py
             ),
             HEAD=SimpleNamespace(
                 TYPE="CENTER",
@@ -217,12 +230,14 @@ def _default_cfg() -> SimpleNamespace:
             RETURN_STAGES=[2, 5, 8, 11],
             HIDDEN_DIM=192,
             NUM_CHANNELS=256,
+            NUM_OBJECT_QUERIES=1,
         ),
         DATA=SimpleNamespace(
             SEARCH=SimpleNamespace(SIZE=SEARCH_SIZE),
             TEMPLATE=SimpleNamespace(SIZE=TEMPLATE_SIZE),
         ),
         TRAIN=SimpleNamespace(DROP_PATH_RATE=0.1),
+        TEST=SimpleNamespace(SEARCH_SIZE=SEARCH_SIZE),
     )
 
 
@@ -266,7 +281,7 @@ def _strip_common_prefixes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
     keys = list(state_dict.keys())
     for prefix in prefixes:
         if keys and all(key.startswith(prefix) for key in keys):
-            return {key[len(prefix) :]: value for key, value in state_dict.items()}
+            return {key[len(prefix):]: value for key, value in state_dict.items()}
     return state_dict
 
 
@@ -288,8 +303,31 @@ def _load_checkpoint_object(path: Path) -> Any:
         return torch.load(path, map_location="cpu")
 
 
+def _hann2d(size: torch.Tensor, centered: bool = True) -> torch.Tensor:
+    """Generate a 2-D Hanning window on CPU, then let caller move to device."""
+    h, w = size[0].item(), size[1].item()
+    hann_h = torch.hann_window(int(h), periodic=False)
+    hann_w = torch.hann_window(int(w), periodic=False)
+    window = hann_h.unsqueeze(1) * hann_w.unsqueeze(0)
+    return window.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+
+
+# ---------------------------------------------------------------------------
+# TrackerModel — full AbaViTrack inference logic merged in
+# ---------------------------------------------------------------------------
+
 class TrackerModel(torch.nn.Module):
-    """Thin inference wrapper around the loaded tracking network."""
+    """Inference wrapper around the loaded tracking network.
+
+    Implements the full AbaViTrack pipeline from abavitrack.py:
+    - Template initialization with optional CE mask
+    - Hanning window penalty on the response map
+    - Cosine similarity memory for adaptive synergy gating
+    - Dynamic search-factor expansion when the target is lost (OOV/panic state)
+    - Box decoding via the network's box head (cal_bbox)
+    - Coordinate back-projection to image space (map_box_back)
+    - Hard clip to image boundaries
+    """
 
     def __init__(
         self,
@@ -297,130 +335,297 @@ class TrackerModel(torch.nn.Module):
         device: torch.device,
         sample_target_fn: Any,
         clip_box_fn: Any,
+        cfg: SimpleNamespace,
     ) -> None:
         super().__init__()
         self.net = net
         self.device = device
         self.sample_target = sample_target_fn
         self.clip_box = clip_box_fn
+        self.cfg = cfg
+
         self.template_factor = TEMPLATE_FACTOR
-        self.search_factor = SEARCH_FACTOR
         self.template_size = TEMPLATE_SIZE
         self.search_size = SEARCH_SIZE
+        self.base_search_factor = SEARCH_FACTOR
+
         self.mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
         self.std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+
+        # Compute feature map spatial size from config
+        feat_sz = cfg.TEST.SEARCH_SIZE // cfg.MODEL.BACKBONE.STRIDE
+        self.feat_sz = feat_sz
+
+        # Hanning window penalty (shape: 1 × 1 × feat_sz × feat_sz)
+        self.output_window = _hann2d(
+            torch.tensor([feat_sz, feat_sz]).long(), centered=True
+        ).to(device)
+
+        # Per-sequence state (reset on each initialize call)
         self.template: Optional[torch.Tensor] = None
-        self.prev_box: Optional[list[float]] = None
-        self.use_amp = device.type == "cuda"
+        self.box_mask_z: Optional[torch.Tensor] = None
+        self.state: Optional[list] = None
+        self.prev_box: Optional[list] = None      # alias kept for safety
+        self.frame_id: int = 0
+        self.current_search_factor: float = self.base_search_factor
+
+        # Adaptive synergy: cosine similarity memory
+        self.target_memory: Optional[torch.Tensor] = None
+        self.memory_lr: float = 0.1
+
+        self.use_amp: bool = device.type == "cuda"
+
+    # ------------------------------------------------------------------
+    # Image preprocessing (mirrors AbaViTrack Preprocessor)
+    # ------------------------------------------------------------------
 
     def _preprocess(self, crop: Any) -> torch.Tensor:
+        """Convert an HxWxC uint8 numpy array to a normalised NCHW tensor."""
         tensor = torch.from_numpy(crop).to(self.device, dtype=torch.float32)
         if tensor.ndim == 2:
             tensor = tensor.unsqueeze(-1).repeat(1, 1, 3)
-        tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+        tensor = tensor.permute(2, 0, 1).unsqueeze(0)   # → (1, C, H, W)
         return (tensor / 255.0 - self.mean) / self.std
+
+    # ------------------------------------------------------------------
+    # Box helpers (ported from AbaViTrack)
+    # ------------------------------------------------------------------
+
+    def _map_box_back(self, pred_box: list, resize_factor: float) -> list:
+        """Project a predicted box from crop-relative to image coordinates."""
+        cx_prev = self.state[0] + 0.5 * self.state[2]
+        cy_prev = self.state[1] + 0.5 * self.state[3]
+        cx, cy, w, h = pred_box
+        half_side = 0.5 * self.search_size / resize_factor
+        cx_real = cx + (cx_prev - half_side)
+        cy_real = cy + (cy_prev - half_side)
+        return [cx_real - 0.5 * w, cy_real - 0.5 * h, w, h]
 
     @staticmethod
     def _box_to_crop_meta(box: Iterable[float], factor: float) -> Tuple[float, float, float]:
+        """Return (x1, y1, crop_sz) used for coordinate back-projection."""
         x, y, w, h = [float(v) for v in box]
         crop_sz = max(1.0, float(math.ceil((w * h) ** 0.5 * factor)))
         x1 = round(x + 0.5 * w - 0.5 * crop_sz)
         y1 = round(y + 0.5 * h - 0.5 * crop_sz)
         return float(x1), float(y1), crop_sz
 
-    def initialize(self, frame: Any, init_box: Iterable[float]) -> list[float]:
-        init_box_list = [float(v) for v in init_box]
-        self.prev_box = init_box_list
-        self.net.eval()
+    # ------------------------------------------------------------------
+    # CE mask (optional, mirrors AbaViTrack.initialize)
+    # ------------------------------------------------------------------
 
-        crop, _, _ = self.sample_target(
-            frame,
+    def _build_ce_mask(self, init_bbox: list, resize_factor: float) -> Optional[torch.Tensor]:
+        """Build a conditional-elimination mask for the template tokens."""
+        ce_loc = getattr(self.cfg.MODEL.BACKBONE, "CE_LOC", None)
+        if not ce_loc:
+            return None
+
+        # Avoid importing generate_mask_cond at module level — it lives inside
+        # the extracted zip. Import lazily after the model stack is loaded.
+        try:
+            from lib.utils.ce_utils import generate_mask_cond  # type: ignore[import]
+        except ImportError:
+            return None
+
+        try:
+            from lib.train.data.processing_utils import (  # type: ignore[import]
+                sample_target as _st,
+            )
+            _, rf, _ = _st(
+                # We only need resize_factor; pass a dummy 1×1 image.
+                torch.zeros(1, 1, 3).numpy(),
+                init_bbox,
+                self.template_factor,
+                output_sz=self.template_size,
+            )
+        except Exception:
+            rf = resize_factor
+
+        # Template bbox in crop coordinates (cx, cy, w, h) ∈ [0, template_size]
+        x, y, w, h = init_bbox
+        cx = (x + w / 2)
+        cy = (y + h / 2)
+        template_bbox = torch.tensor(
+            [[cx * rf / self.template_size,
+              cy * rf / self.template_size,
+              w * rf / self.template_size,
+              h * rf / self.template_size]],
+            device=self.device,
+        )
+
+        try:
+            return generate_mask_cond(self.cfg, 1, self.device, template_bbox)
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Public interface: initialize / track
+    # ------------------------------------------------------------------
+
+    def initialize(self, frame: Any, init_box: Iterable[float]) -> list:
+        """Process the first frame and store the template.
+
+        Args:
+            frame: HxWxC BGR uint8 numpy array (from cv2.VideoCapture).
+            init_box: (x, y, w, h) ground-truth box for frame 0.
+
+        Returns:
+            The initialisation box as a list of floats.
+        """
+        init_box_list = [float(v) for v in init_box]
+        self.state = init_box_list
+        self.prev_box = init_box_list
+        self.frame_id = 0
+        self.target_memory = None
+        self.current_search_factor = self.base_search_factor
+
+        # Convert BGR → RGB for the network
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        z_patch_arr, resize_factor, z_amask_arr = self.sample_target(
+            frame_rgb,
             init_box_list,
             self.template_factor,
             output_sz=self.template_size,
         )
-        self.template = self._preprocess(crop)
+
+        self.template = self._preprocess(z_patch_arr)
+
+        # Optional CE mask
+        self.box_mask_z = self._build_ce_mask(init_box_list, resize_factor)
+
         return init_box_list
 
-    def _forward_net(self, search: torch.Tensor) -> Optional[torch.Tensor]:
-        if self.template is None:
-            return None
+    def track(self, frame: Any) -> list:
+        """Track the target in a new frame.
 
-        try:
-            output = self.net(self.template, search)
-        except TypeError:
-            output = self.net(template=self.template, search=search)
+        Args:
+            frame: HxWxC BGR uint8 numpy array.
 
-        if isinstance(output, dict):
-            for key in ("pred_boxes", "bbox", "boxes", "pred_box"):
-                value = output.get(key)
-                if torch.is_tensor(value):
-                    return value
-            return None
-
-        if isinstance(output, (tuple, list)) and output:
-            for item in output:
-                if torch.is_tensor(item):
-                    return item
-            return None
-
-        if torch.is_tensor(output):
-            return output
-
-        return None
-
-    def _decode_prediction(
-        self,
-        pred: torch.Tensor,
-        frame_shape: Tuple[int, int],
-        crop_meta: Tuple[float, float, float],
-    ) -> list[float]:
-        pred = pred.detach()
-        if pred.ndim > 1:
-            pred = pred.reshape(-1, pred.shape[-1])[0]
-        pred = pred.float().cpu()
-
-        if pred.numel() != 4 or not torch.isfinite(pred).all():
-            return self.prev_box[:] if self.prev_box is not None else [0.0, 0.0, 0.0, 0.0]
-
-        cx, cy, w, h = pred.tolist()
-        x1, y1, crop_sz = crop_meta
-
-        abs_cx = x1 + cx * crop_sz
-        abs_cy = y1 + cy * crop_sz
-        abs_w = max(1.0, w * crop_sz)
-        abs_h = max(1.0, h * crop_sz)
-
-        box = [abs_cx - abs_w / 2, abs_cy - abs_h / 2, abs_w, abs_h]
-        return self.clip_box(box, frame_shape[0], frame_shape[1])
-
-    def track(self, frame: Any) -> list[float]:
-        if self.prev_box is None:
+        Returns:
+            Predicted (x, y, w, h) bounding box in image coordinates.
+        """
+        if self.state is None:
             raise RuntimeError("TrackerModel.track() called before initialize().")
 
-        search_crop, _, _ = self.sample_target(
-            frame,
-            self.prev_box,
-            self.search_factor,
+        H, W = frame.shape[:2]
+        self.frame_id += 1
+
+        # Convert BGR → RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # ── 1. Crop the search region with the DYNAMIC search factor ──────────
+        x_patch_arr, resize_factor, x_amask_arr = self.sample_target(
+            frame_rgb,
+            self.state,
+            self.current_search_factor,
             output_sz=self.search_size,
         )
-        search = self._preprocess(search_crop)
-        crop_meta = self._box_to_crop_meta(self.prev_box, self.search_factor)
+        search = self._preprocess(x_patch_arr)
 
-        with torch.inference_mode():
+        # ── 2. Forward pass ───────────────────────────────────────────────────
+        with torch.no_grad():
             if self.use_amp:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    pred = self._forward_net(search)
+                    out_dict = self.net.forward(
+                        template=self.template.to(self.device),
+                        search=search.to(self.device),
+                    )
             else:
-                pred = self._forward_net(search)
+                out_dict = self.net.forward(
+                    template=self.template.to(self.device),
+                    search=search.to(self.device),
+                )
 
-        if pred is None:
-            return self.prev_box[:]
+        # ── 3. Hanning-penalised response map ─────────────────────────────────
+        pred_score_map = out_dict["score_map"]
+        response = self.output_window * pred_score_map
+        max_confidence = response.max().item()
 
-        next_box = self._decode_prediction(pred, frame.shape[:2], crop_meta)
-        self.prev_box = next_box
-        return next_box
+        # ── 4. Extract peak-location feature for cosine similarity ────────────
+        opt_feat = out_dict["opt_feat"]          # (1, C, H_feat, W_feat)
+        _, _, H_feat, W_feat = opt_feat.shape
+        _, _, H_map, W_map = response.shape
 
+        max_idx = response.view(-1).argmax().item()
+        peak_y_map = max_idx // W_map
+        peak_x_map = max_idx % W_map
+
+        # Proportionally project coordinate to ViT feature grid
+        peak_y_feat = int(peak_y_map * (H_feat / H_map))
+        peak_x_feat = int(peak_x_map * (W_feat / W_map))
+
+        current_target_feat = opt_feat[0, :, peak_y_feat, peak_x_feat].clone().detach()
+
+        # ── 5. Cosine similarity verification ─────────────────────────────────
+        if self.target_memory is None:
+            self.target_memory = current_target_feat.clone().detach()
+            similarity_score = 1.0
+        else:
+            similarity_score = F.cosine_similarity(
+                current_target_feat.unsqueeze(0),
+                self.target_memory.unsqueeze(0),
+            ).item()
+
+        # ── 6. Decode bounding box from box head ──────────────────────────────
+        pred_boxes = self.net.box_head.cal_bbox(
+            response, out_dict["size_map"], out_dict["offset_map"]
+        )
+        pred_boxes = pred_boxes.view(-1, 4)
+        pred_box = (pred_boxes.mean(dim=0) * self.search_size / resize_factor).tolist()
+        visual_bbox = self.clip_box(
+            self._map_box_back(pred_box, resize_factor), H, W, margin=10
+        )
+
+        # ── 7. Adaptive Synergy decision ──────────────────────────────────────
+        base_conf = 0.35
+        base_sim = 0.50
+
+        # Dynamic threshold relaxation (from abavitrack.py)
+        dynamic_conf_thresh = base_conf - (max(0.0, similarity_score - 0.65) * 0.5)
+        dynamic_sim_thresh  = base_sim  - (max(0.0, max_confidence - 0.50) * 0.4)
+
+        # Absolute minimums to prevent tracking background noise
+        dynamic_conf_thresh = max(0.15, dynamic_conf_thresh)
+        dynamic_sim_thresh  = max(0.35, dynamic_sim_thresh)
+
+        is_target_confirmed = (
+            max_confidence > dynamic_conf_thresh
+            and similarity_score > dynamic_sim_thresh
+        )
+
+        if is_target_confirmed:
+            # FOCUS STATE: target confirmed → update state and memory
+            self.state = visual_bbox
+            self.prev_box = visual_bbox
+            self.current_search_factor = self.base_search_factor
+
+            # Learn faster when confident, slower when borderline
+            current_lr = self.memory_lr if similarity_score > 0.60 else (self.memory_lr / 2.0)
+            self.target_memory = (
+                (1.0 - current_lr) * self.target_memory
+                + current_lr * current_target_feat.clone().detach()
+            )
+        else:
+            # PANIC STATE: OOV or distractor → freeze box, expand search window
+            if self.current_search_factor < 16.0:
+                self.current_search_factor *= 1.5
+            # self.state is intentionally not updated here
+
+        return list(self.state)
+
+    # ------------------------------------------------------------------
+    # Convenience: allow model.eval() to propagate
+    # ------------------------------------------------------------------
+
+    def eval(self) -> "TrackerModel":  # type: ignore[override]
+        self.net.eval()
+        return super().eval()
+
+
+# ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
 
 def _resolve_checkpoint_path() -> Path:
     if CHECKPOINT_PATH.exists():
@@ -435,22 +640,29 @@ def load_model(device: str = "cuda") -> TrackerModel:
     _ensure_legacy_namespace()
     build_abavitrack, sample_target_fn, clip_box_fn = _import_model_stack()
 
-    torch_device = torch.device(device if device == "cpu" or torch.cuda.is_available() else "cpu")
+    torch_device = torch.device(
+        device if device == "cpu" or torch.cuda.is_available() else "cpu"
+    )
     if torch_device.type == "cuda":
         torch.backends.cudnn.enabled = False
         torch.backends.cudnn.benchmark = False
+
     checkpoint_path = _resolve_checkpoint_path()
     try:
         checkpoint = _load_checkpoint_object(checkpoint_path)
     except Exception as exc:
-        print(f"Warning: checkpoint load failed ({exc}); using the instantiated model without weight restoration.")
+        print(
+            f"Warning: checkpoint load failed ({exc}); "
+            "using the instantiated model without weight restoration."
+        )
         checkpoint = None
+
+    cfg = _default_cfg()
 
     if isinstance(checkpoint, torch.nn.Module):
         net = checkpoint
     else:
         state_dict = _extract_state_dict(checkpoint)
-        cfg = _default_cfg()
         net = build_abavitrack(cfg, training=False)
 
         if state_dict is not None:
@@ -462,7 +674,10 @@ def load_model(device: str = "cuda") -> TrackerModel:
                     f"unexpected={len(unexpected_keys)} keys.",
                 )
         else:
-            print("Checkpoint did not contain a plain state dict; using the instantiated model as-is.")
+            print(
+                "Checkpoint did not contain a plain state dict; "
+                "using the instantiated model as-is."
+            )
 
     net = net.to(torch_device)
     _move_plain_tensor_attrs(net, torch_device)
@@ -473,12 +688,13 @@ def load_model(device: str = "cuda") -> TrackerModel:
         device=torch_device,
         sample_target_fn=sample_target_fn,
         clip_box_fn=clip_box_fn,
+        cfg=cfg,
     )
     tracker.eval()
     return tracker
 
 
-def read_init_box(path: str) -> list[float]:
+def read_init_box(path: str) -> list:
     """Read the first-frame annotation in ``x,y,w,h`` format."""
 
     with open(path, "r", encoding="utf-8") as f:
@@ -492,10 +708,10 @@ def run_tracker(
     model: Any,
     video_path: str,
     init_box_path: str,
-) -> list[dict[str, float]]:
+) -> list:
     """Run tracking on one video sequence and return frame-wise predictions."""
 
-    predictions: list[dict[str, float]] = []
+    predictions: list = []
     init_box = read_init_box(init_box_path)
 
     cap = cv2.VideoCapture(video_path)
