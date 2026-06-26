@@ -40,8 +40,7 @@ Two model checkpoints are supported:
 | Full-precision | `checkpoints/model.pth` | Original FP32 checkpoint (download via `download.py`) or https://drive.google.com/drive/folders/1Ii08izcdhpvRP-O97IKXhrzzwyTvNUgY?usp=sharing |
 | Quantized | `checkpoints/model_quantized.pth` | https://drive.google.com/drive/folders/1M4pKiVxIzu4DK3d9ENDoiNMykyhWPgcN?usp=sharing               |
 
-> **Note:** The quantized checkpoint is produced by post-training quantization (e.g., dynamic INT8) for edge deployment. Replace the placeholder above with the actual file path once available.
-
+> **Note:** The quantized checkpoint is produced by post-training quantization for edge deployment.
 ---
 
 ## Prerequisites
