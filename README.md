@@ -35,10 +35,10 @@ The tracker:
 
 Two model checkpoints are supported:
 
-| Checkpoint | Path | Description |
-|------------|------|-------------|
-| Full-precision | `checkpoints/model.pth` | Original FP32 checkpoint (download via `download.py`) |
-| Quantized | `checkpoints/model_quantized.pth` | [PLACEHOLDER — quantized checkpoint path] |
+| Checkpoint | Path | Description                                               |
+|------------|------|-----------------------------------------------------------|
+| Full-precision | `checkpoints/model.pth` | Original FP32 checkpoint (download via `download.py`) or https://drive.google.com/drive/folders/1Ii08izcdhpvRP-O97IKXhrzzwyTvNUgY?usp=sharing |
+| Quantized | `checkpoints/model_quantized.pth` | https://drive.google.com/drive/folders/1M4pKiVxIzu4DK3d9ENDoiNMykyhWPgcN?usp=sharing               |
 
 > **Note:** The quantized checkpoint is produced by post-training quantization (e.g., dynamic INT8) for edge deployment. Replace the placeholder above with the actual file path once available.
 
@@ -273,8 +273,8 @@ torch.backends.cudnn.benchmark = False
 
 | Resource | Link/Location |
 |----------|---------------|
-| Original Paper | [PLACEHOLDER — AbaViTrack paper URL/DOI] |
-| Optimization Report | [PLACEHOLDER — link to quantization/optimization report] |
+| Original Paper | https://openaccess.thecvf.com/content/ICCV2023/papers/Li_Adaptive_and_Background-Aware_Vision_Transformer_for_Real-Time_UAV_Tracking_ICCV_2023_paper.pdf |
+| Optimization Report | https://drive.google.com/drive/folders/1KQfS5pRW-1VqE3slSg72Ztb_hQpycxtN?usp=sharing|
 
 ---
 
